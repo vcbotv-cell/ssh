@@ -17,19 +17,23 @@ echo "       R-BOTS SSH + CLOUDFLARED"
 echo "=========================================="
 echo
 
-# Root check
+# ------------------------------------------
+# ROOT CHECK
+# ------------------------------------------
+
 if [ "$(id -u)" != "0" ]; then
-    echo -e "${RED}Run this script as root.${RESET}"
+    echo -e "${RED}Please run this script as root.${RESET}"
     exit 1
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ==========================================
-# 1. INSTALL REQUIRED PACKAGES
-# ==========================================
+# ------------------------------------------
+# 1. INSTALL PACKAGES
+# ------------------------------------------
 
 echo -e "${CYAN}[1/7] Installing required packages...${RESET}"
+echo
 
 apt-get update -y
 
@@ -38,21 +42,22 @@ apt-get install -y \
     curl \
     ca-certificates \
     supervisor \
-    iproute2 \
-    python3
+    iproute2
 
-echo -e "${GREEN}Packages installed.${RESET}"
+echo
+echo -e "${GREEN}Packages installed successfully.${RESET}"
 echo
 
-# ==========================================
+# ------------------------------------------
 # 2. CONFIGURE SSH
-# ==========================================
+# ------------------------------------------
 
 echo -e "${CYAN}[2/7] Configuring SSH...${RESET}"
+echo
 
 mkdir -p /run/sshd
 
-# Remove old/conflicting values
+# Remove old settings to prevent duplicates
 sed -i '/^[[:space:]]*PermitRootLogin[[:space:]]/d' /etc/ssh/sshd_config
 sed -i '/^[[:space:]]*PasswordAuthentication[[:space:]]/d' /etc/ssh/sshd_config
 
@@ -62,19 +67,25 @@ cat >> /etc/ssh/sshd_config <<'EOF'
 PermitRootLogin yes
 PasswordAuthentication yes
 PubkeyAuthentication yes
-UsePAM yes
 EOF
 
+# Test SSH config
 /usr/sbin/sshd -t
 
-echo -e "${GREEN}SSH configuration OK.${RESET}"
+# Start SSH if not already running
+if ! ss -lnt 2>/dev/null | grep -q ':22 '; then
+    /usr/sbin/sshd
+fi
+
+echo -e "${GREEN}SSH is ready on port 22.${RESET}"
 echo
 
-# ==========================================
+# ------------------------------------------
 # 3. INSTALL CLOUDFLARED FROM GITHUB
-# ==========================================
+# ------------------------------------------
 
 echo -e "${CYAN}[3/7] Installing Cloudflared from GitHub...${RESET}"
+echo
 
 ARCH=$(dpkg --print-architecture)
 
@@ -95,6 +106,9 @@ case "$ARCH" in
 esac
 
 echo "Architecture: $CF_ARCH"
+echo
+
+rm -f /tmp/cloudflared
 
 curl -fL \
     "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" \
@@ -105,25 +119,26 @@ install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
 rm -f /tmp/cloudflared
 
 echo
+echo "Installed:"
 /usr/local/bin/cloudflared --version
 echo
 
-echo -e "${GREEN}Cloudflared installed.${RESET}"
+echo -e "${GREEN}Cloudflared installed successfully.${RESET}"
 echo
 
-# ==========================================
-# 4. CLOUDFLARE TOKEN
-# ==========================================
+# ------------------------------------------
+# 4. ASK FOR TOKEN
+# ------------------------------------------
 
 echo "=========================================="
 echo "        CLOUDFLARE TUNNEL TOKEN"
 echo "=========================================="
 echo
 echo "Paste your Cloudflare Tunnel Token."
-echo "The token will not be displayed."
+echo "Your token will remain hidden."
 echo
 
-read -rsp "Tunnel Token: " CF_TOKEN
+read -rsp "Enter your Cloudflare Tunnel Token: " CF_TOKEN
 echo
 echo
 
@@ -135,13 +150,19 @@ fi
 mkdir -p /etc/cloudflared
 chmod 700 /etc/cloudflared
 
+# Save token securely
 printf '%s' "$CF_TOKEN" > /etc/cloudflared/token
 chmod 600 /etc/cloudflared/token
 
+# Remove token from shell variable
 unset CF_TOKEN
 
+# ------------------------------------------
+# 5. TEST TOKEN / CONNECTION
+# ------------------------------------------
+
 echo
-echo -e "${CYAN}[4/7] Testing Cloudflare Tunnel...${RESET}"
+echo -e "${CYAN}[4/7] Connecting to Cloudflare Tunnel...${RESET}"
 echo
 
 rm -f /tmp/cloudflared-test.log
@@ -152,32 +173,57 @@ rm -f /tmp/cloudflared-test.log
 
 TEST_PID=$!
 
-# Give cloudflared time to connect
-sleep 12
+# Wait for Cloudflare connection
+CONNECTED=0
 
-if ! kill -0 "$TEST_PID" 2>/dev/null; then
+for i in $(seq 1 20); do
+
+    # Process exited = failure
+    if ! kill -0 "$TEST_PID" 2>/dev/null; then
+        break
+    fi
+
+    if grep -Eqi \
+        "Registered tunnel connection|Connection .* registered|registered.*connection" \
+        /tmp/cloudflared-test.log; then
+
+        CONNECTED=1
+        break
+    fi
+
+    sleep 1
+done
+
+if [ "$CONNECTED" != "1" ]; then
+
+    # Give process a final moment
+    sleep 2
+
+    if kill -0 "$TEST_PID" 2>/dev/null; then
+        CONNECTED=1
+    fi
+fi
+
+if [ "$CONNECTED" != "1" ]; then
+
     echo
     echo -e "${RED}Cloudflare Tunnel failed.${RESET}"
     echo
+    echo "Cloudflared output:"
+    echo "------------------------------------------"
     cat /tmp/cloudflared-test.log
+    echo "------------------------------------------"
     echo
+    echo "The token may be invalid or the tunnel may be unavailable."
+
+    rm -f /tmp/cloudflared-test.log
+
     exit 1
 fi
 
-# Check for successful connection
-if grep -Eqi \
-    "Registered tunnel connection|Connection .* registered|connected" \
-    /tmp/cloudflared-test.log; then
-
-    echo -e "${GREEN}Cloudflare Tunnel connected successfully.${RESET}"
-
-else
-    echo -e "${YELLOW}Tunnel process is running.${RESET}"
-    echo "Cloudflare did not print a connection message yet."
-    echo
-    echo "Recent log:"
-    tail -20 /tmp/cloudflared-test.log
-fi
+echo
+echo -e "${GREEN}Cloudflare Tunnel connected successfully.${RESET}"
+echo
 
 # Stop temporary test
 kill "$TEST_PID" 2>/dev/null || true
@@ -187,12 +233,11 @@ wait "$TEST_PID" 2>/dev/null || true
 
 rm -f /tmp/cloudflared-test.log
 
+# ------------------------------------------
+# 6. ROOT PASSWORD
+# ------------------------------------------
+
 echo
-
-# ==========================================
-# 5. ROOT PASSWORD
-# ==========================================
-
 echo "=========================================="
 echo "          CREATE ROOT PASSWORD"
 echo "=========================================="
@@ -201,18 +246,17 @@ echo
 passwd root
 
 echo
+echo -e "${GREEN}Root password configured.${RESET}"
+echo
 
-# ==========================================
-# 6. SSH + CLOUDFLARED AUTO RESTART
-# ==========================================
+# ------------------------------------------
+# 7. SUPERVISOR AUTO RESTART
+# ------------------------------------------
 
-echo -e "${CYAN}[6/7] Configuring automatic services...${RESET}"
+echo -e "${CYAN}[5/7] Configuring Cloudflared auto-restart...${RESET}"
+echo
 
 mkdir -p /var/log/cloudflared
-
-# ------------------------------------------
-# Cloudflared supervisor
-# ------------------------------------------
 
 cat > /etc/supervisor/conf.d/cloudflared.conf <<'EOF'
 [program:cloudflared]
@@ -221,6 +265,7 @@ directory=/root
 
 autostart=true
 autorestart=true
+
 startsecs=5
 startretries=999999
 
@@ -238,7 +283,7 @@ stderr_logfile_backups=3
 EOF
 
 # ------------------------------------------
-# SSH watchdog
+# SSH WATCHDOG
 # ------------------------------------------
 
 cat > /usr/local/bin/ssh-watchdog.sh <<'EOF'
@@ -264,6 +309,7 @@ directory=/root
 
 autostart=true
 autorestart=true
+
 startsecs=2
 startretries=999999
 
@@ -280,21 +326,13 @@ EOF
 echo -e "${GREEN}Auto-restart configured.${RESET}"
 echo
 
-# ==========================================
-# 7. START SERVICES
-# ==========================================
+# ------------------------------------------
+# START SUPERVISOR
+# ------------------------------------------
 
-echo -e "${CYAN}[7/7] Starting services...${RESET}"
+echo -e "${CYAN}[6/7] Starting Supervisor...${RESET}"
+echo
 
-mkdir -p /run/sshd
-
-# Start SSH
-if ! ss -lnt 2>/dev/null | grep -q ':22 '; then
-    /usr/sbin/sshd
-fi
-
-# Start supervisor manually because Railway
-# containers normally don't run systemd
 if ! pgrep -x supervisord >/dev/null 2>&1; then
     supervisord -c /etc/supervisor/supervisord.conf
     sleep 2
@@ -303,50 +341,50 @@ fi
 supervisorctl reread
 supervisorctl update
 
+# Start Cloudflared
 supervisorctl restart cloudflared 2>/dev/null || \
 supervisorctl start cloudflared
 
+# Start SSH watchdog
 supervisorctl restart ssh-watchdog 2>/dev/null || \
 supervisorctl start ssh-watchdog
 
 sleep 5
 
-# ==========================================
-# FINAL STATUS
-# ==========================================
+# ------------------------------------------
+# FINAL CHECK
+# ------------------------------------------
 
-echo
-echo "=========================================="
-echo "          INSTALLATION COMPLETE"
-echo "=========================================="
+echo -e "${CYAN}[7/7] Checking services...${RESET}"
 echo
 
-echo -e "${GREEN}SSH:${RESET}"
-echo "  User : root"
-echo "  Port : 22"
+echo "SSH:"
+if ss -lnt 2>/dev/null | grep -q ':22 '; then
+    echo -e "${GREEN}SSH is listening on port 22.${RESET}"
+else
+    echo -e "${RED}SSH is not listening.${RESET}"
+fi
 
 echo
-echo -e "${GREEN}SSH Status:${RESET}"
-ss -lnt 2>/dev/null | grep ':22 ' || true
-
-echo
-echo -e "${GREEN}Cloudflared Status:${RESET}"
+echo "Cloudflared:"
 supervisorctl status cloudflared
 
 echo
-echo -e "${GREEN}SSH Watchdog:${RESET}"
+echo "SSH Watchdog:"
 supervisorctl status ssh-watchdog
-
-echo
-echo "Cloudflared log:"
-echo "  tail -f /var/log/cloudflared/cloudflared.log"
-
-echo
-echo "Cloudflared error log:"
-echo "  tail -f /var/log/cloudflared/cloudflared-error.log"
 
 echo
 echo "=========================================="
 echo -e "${GREEN}          R-BOTS READY 🚀${RESET}"
 echo "=========================================="
 echo
+echo "SSH User : root"
+echo "SSH Port : 22"
+echo
+echo "Cloudflared log:"
+echo "tail -f /var/log/cloudflared/cloudflared.log"
+echo
+echo "Cloudflared error log:"
+echo "tail -f /var/log/cloudflared/cloudflared-error.log"
+echo
+echo "=========================================="
